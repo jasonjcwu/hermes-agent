@@ -21,13 +21,20 @@ Key properties
 Config (config.yaml)::
 
     advisor:
-      enabled: true
-      model: "deepseek-chat"          # advisor model (required when enabled)
-      provider: "custom:deepseek"     # provider key (optional — uses main provider)
-      max_uses_per_task: 5            # per-task invocation cap
-      temperature: 0.3                # advisor sampling temperature
-      max_tokens: 2048                # max tokens per advisor response
-      system_prompt: null             # custom system prompt (optional)
+      model: "deepseek-v4-pro"           # advisor model (defaults to agent's own model)
+      max_uses_per_task: 5                # per-task invocation cap (default: 5)
+      max_context_messages: 20            # rolling window of recent messages
+      max_context_chars: 300              # per-message content truncation length
+      max_tool_output_chars: 600          # tool result truncation length
+      timeout: 30                         # API call timeout (seconds)
+      temperature: 0.3                    # advisor sampling temperature
+      max_tokens: 2048                    # max tokens per advisor response
+      system_prompt: null                 # custom system prompt (optional)
+
+Zero-config: if no ``advisor:`` section exists in config.yaml, the tool
+automatically inherits the agent's own model, API key, and base URL.
+Only set explicit values when you want a *different* model as advisor.
+Set ``advisor.enabled: false`` to hide the tool entirely (not recommended).
 """
 
 import json
@@ -49,6 +56,10 @@ _DEFAULT_ADVISOR_CONFIG: Dict[str, Any] = {
     "base_url": None,
     "api_key": None,
     "max_uses_per_task": 5,
+    "max_context_messages": 20,     # rolling window of recent messages
+    "max_context_chars": 300,       # per-message content truncation
+    "max_tool_output_chars": 600,   # tool result truncation
+    "timeout": 30,                  # API call timeout (seconds)
     "temperature": 0.3,
     "max_tokens": 2048,
     "system_prompt": None,
@@ -56,7 +67,7 @@ _DEFAULT_ADVISOR_CONFIG: Dict[str, Any] = {
 
 
 def load_advisor_config() -> Dict[str, Any]:
-    """Merge user config onto defaults (config.yaml → env vars → defaults)."""
+    """Merge user config onto defaults (config.yaml -> env vars -> defaults)."""
     cfg = dict(_DEFAULT_ADVISOR_CONFIG)
 
     # 1) config.yaml ``advisor:`` section
@@ -89,12 +100,16 @@ def load_advisor_config() -> Dict[str, Any]:
 # Message sanitization
 # ---------------------------------------------------------------------------
 
-def _sanitize_for_advisor(messages: List[dict]) -> List[dict]:
+def _sanitize_for_advisor(messages: List[dict], max_tool_output_chars: int = 600) -> List[dict]:
     """Strip tool_calls / tool roles so the advisor sees plain text only.
 
     The advisor model does *not* support tools — feeding it raw executor
     messages with ``tool_calls`` dicts or ``role: "tool"`` would cause API
     errors or garbled output.
+
+    Args:
+        messages: Executor conversation messages.
+        max_tool_output_chars: Truncation limit for tool result content.
     """
     out: List[dict] = []
     for msg in messages:
@@ -134,14 +149,13 @@ def _sanitize_for_advisor(messages: List[dict]) -> List[dict]:
             if text.strip():
                 out.append({"role": "assistant", "content": text})
 
-        # --- tool results → user ---
+        # --- tool results -> assistant-annotated user context ---
         elif role == "tool":
             text = content if isinstance(content, str) else str(content)
-            # Truncate very long tool outputs
-            if len(text) > 600:
-                text = text[:600] + "…(truncated)"
+            if len(text) > max_tool_output_chars:
+                text = text[:max_tool_output_chars] + "...(truncated)"
             if text.strip():
-                out.append({"role": "user", "content": f"[Tool output] {text}"})
+                out.append({"role": "user", "content": f"[Tool result]\n{text}"})
 
     return out
 
@@ -187,12 +201,15 @@ def call_advisor(
     """
     import openai
 
-    # ---- Resolve API credentials ----
+    # ---- Resolve model ----
     advisor_model = config.get("model")
+    if not advisor_model and parent_agent:
+        # Zero-config: inherit model from the executing agent itself
+        advisor_model = getattr(parent_agent, "model", None)
     if not advisor_model:
         return json.dumps({"error": "advisor.model is not configured — set it in config.yaml or HERMES_ADVISOR_MODEL"})
 
-    # Try credential pool first (supports key rotation)
+    # ---- Resolve API credentials ----
     api_key = config.get("api_key")
     base_url = config.get("base_url")
 
@@ -208,21 +225,32 @@ def call_advisor(
         except Exception:
             pass
 
-    # Fall back to parent agent's credentials if advisor shares the same provider
+    # Fall back to parent agent's credentials (zero-config path)
     if not api_key and parent_agent:
-        parent_provider = getattr(parent_agent, "provider", "") or ""
-        advisor_provider = config.get("provider", "") or ""
-        if not advisor_provider or parent_provider == advisor_provider:
-            api_key = getattr(parent_agent, "api_key", None)
-            base_url = base_url or getattr(parent_agent, "base_url", None)
+        api_key = getattr(parent_agent, "api_key", None)
+        base_url = base_url or getattr(parent_agent, "base_url", None)
+        # If parent also has a credential pool, try that too
+        if not api_key:
+            try:
+                parent_pool = getattr(parent_agent, "_credential_pool", None)
+                if parent_pool:
+                    parent_provider = getattr(parent_agent, "provider", "")
+                    cred = parent_pool.get_credentials(parent_provider) if parent_provider else None
+                    if cred:
+                        api_key = cred.get("api_key") or cred.get("key")
+            except Exception:
+                pass
 
     if not api_key:
         return json.dumps({"error": "No API key found for advisor — configure advisor.api_key or advisor.provider in config.yaml"})
 
     # ---- Sanitize executor messages ----
-    clean = _sanitize_for_advisor(messages)
-    # Keep a rolling window of the last 20 messages to stay within context
-    context_msgs = clean[-20:]
+    max_tool_chars = config.get("max_tool_output_chars", 600)
+    clean = _sanitize_for_advisor(messages, max_tool_output_chars=max_tool_chars)
+
+    # ---- Rolling window ----
+    max_context_msgs = config.get("max_context_messages", 20)
+    context_msgs = clean[-max_context_msgs:]
 
     # ---- Build advisor prompt ----
     advisor_messages: List[dict] = [
@@ -230,10 +258,12 @@ def call_advisor(
     ]
 
     if context_msgs:
-        context_summary = json.dumps(
-            [{"role": m["role"], "content": m["content"][:300]} for m in context_msgs],
-            ensure_ascii=False,
-        )
+        max_chars = config.get("max_context_chars", 300)
+        safe_context = []
+        for m in context_msgs:
+            content = (m.get("content") or "")[:max_chars]
+            safe_context.append({"role": m["role"], "content": content})
+        context_summary = json.dumps(safe_context, ensure_ascii=False)
         advisor_messages.append({
             "role": "user",
             "content": f"Executor's conversation context (recent):\n{context_summary}",
@@ -248,6 +278,10 @@ def call_advisor(
     client_kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         client_kwargs["base_url"] = base_url
+
+    # Timeout: build from config
+    timeout = config.get("timeout", 30)
+    client_kwargs["timeout"] = timeout
 
     start = time.time()
     try:
@@ -277,16 +311,7 @@ def call_advisor(
 
 
 # ---------------------------------------------------------------------------
-# Availability check
-# ---------------------------------------------------------------------------
-
-def check_advisor_requirements() -> bool:
-    """Return True only when advisor is explicitly enabled in config."""
-    return load_advisor_config().get("enabled", False)
-
-
-# ---------------------------------------------------------------------------
-# Per-task invocation counter (reset per conversation)
+# Per-task invocation counter (reset per task)
 # ---------------------------------------------------------------------------
 
 def _make_use_counter():
@@ -350,6 +375,5 @@ registry.register(
     handler=lambda args, **kw: tool_error(
         "ask_advisor", "must be dispatched via invoke_tool (agent-level tool)"
     ),
-    check_fn=check_advisor_requirements,
-    emoji="🧠",
+    emoji="\U0001f9e0",
 )
