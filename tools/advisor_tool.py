@@ -13,8 +13,9 @@ Design inspired by Anthropic's Advisor Strategy:
 Key properties
 --------------
 * **Executor retains control** — the advisor never calls tools or modifies state.
-* **Lightweight** — a single chat-completions call (~500-1000 tokens per query).
-* **Model-agnostic** — works with any OpenAI-compatible advisor model.
+* **Lightweight** — a single API call (~500-1000 tokens per query).
+* **Multi-provider** — routes via OpenAI-compatible or Anthropic-native API
+  depending on the configured provider/model.
 * **Message sanitization** — executor messages (tool_calls, tool roles) are
   cleaned into plain text before sending to the advisor.
 
@@ -22,6 +23,7 @@ Config (config.yaml)::
 
     advisor:
       model: "deepseek-v4-pro"           # advisor model (defaults to agent's own model)
+      provider: null                      # "anthropic" for Claude native API (auto-detected)
       max_uses_per_task: 5                # per-task invocation cap (default: 5)
       max_context_messages: 20            # rolling window of recent messages
       max_context_chars: 300              # per-message content truncation length
@@ -35,6 +37,12 @@ Zero-config: if no ``advisor:`` section exists in config.yaml, the tool
 automatically inherits the agent's own model, API key, and base URL.
 Only set explicit values when you want a *different* model as advisor.
 Set ``advisor.enabled: false`` to hide the tool entirely (not recommended).
+
+Provider auto-detection: when ``provider`` is not explicitly set to
+``"anthropic"``, the tool auto-detects Anthropic-native routing by checking:
+(1) API key prefix ``sk-ant-``, (2) model name contains ``claude-``,
+(3) base_url host is ``anthropic.com``.  Otherwise falls back to
+OpenAI-compatible ``/chat/completions``.
 """
 
 import json
@@ -182,6 +190,136 @@ Rules:
 
 
 # ---------------------------------------------------------------------------
+# Provider detection
+# ---------------------------------------------------------------------------
+
+def _detect_anthropic_native(api_key: str, model: str, base_url: str | None,
+                              provider: str | None) -> bool:
+    """Return True if the advisor should use Anthropic's native Messages API.
+
+    Checks in order of confidence:
+    1. Explicit ``provider: "anthropic"`` in config
+    2. API key uses the ``sk-ant-`` prefix (Anthropic-issued keys)
+    3. Model name contains ``claude-`` (Claude family models)
+    4. base_url host is ``anthropic.com``
+    """
+    if provider and provider.lower() == "anthropic":
+        return True
+    if api_key and (api_key.startswith("sk-ant-") or api_key.startswith("cc-")):
+        return True
+    if model and "claude-" in model.lower():
+        return True
+    if base_url and "anthropic.com" in str(base_url).lower():
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Anthropic-native advisor call
+# ---------------------------------------------------------------------------
+
+def _call_advisor_anthropic(
+    *,
+    advisor_messages: List[dict],
+    advisor_model: str,
+    api_key: str,
+    base_url: str | None,
+    config: Dict[str, Any],
+) -> str:
+    """Call the advisor via Anthropic's native Messages API (beta).
+
+    Returns the same JSON string format as ``call_advisor``:
+    ``{"advice": ..., "model": ..., "tokens_in": ..., "tokens_out": ..., "latency_ms": ...}``
+    """
+    from agent.anthropic_adapter import (
+        build_anthropic_client,
+        normalize_model_name,
+        _get_anthropic_max_output,
+    )
+
+    # ---- Separate system prompt from messages ----
+    # Anthropic takes system as a top-level parameter, not as a message role.
+    system_text: str | None = None
+    anthropic_messages: List[dict] = []
+
+    for msg in advisor_messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            system_text = content if isinstance(content, str) else str(content)
+        elif role == "user":
+            anthropic_messages.append({"role": "user", "content": content})
+        elif role == "assistant":
+            anthropic_messages.append({"role": "assistant", "content": content})
+
+    # ---- Build client ----
+    try:
+        client_kwargs: Dict[str, Any] = {
+            "api_key": api_key,
+            "timeout": config.get("timeout", 30),
+        }
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client = build_anthropic_client(**client_kwargs)
+    except Exception as exc:
+        logger.warning("advisor: failed to build Anthropic client: %s", exc)
+        return json.dumps({"error": f"Failed to build Anthropic client: {exc}"})
+
+    # ---- Model name normalization ----
+    # Convert "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6"
+    model_normalized = normalize_model_name(advisor_model)
+
+    # ---- Resolve max_tokens ----
+    max_tokens_requested = config.get("max_tokens", 2048)
+    if isinstance(max_tokens_requested, (int, float)) and max_tokens_requested > 0:
+        max_tokens = int(max_tokens_requested)
+    else:
+        max_tokens = _get_anthropic_max_output(model_normalized)
+
+    # ---- API call via beta.messages.create ----
+    # Beta path gives access to newer features; same parameter surface as
+    # messages.create for non-tool-calling requests.
+    start = time.time()
+    try:
+        create_kwargs: Dict[str, Any] = {
+            "model": model_normalized,
+            "messages": anthropic_messages,
+            "max_tokens": max_tokens,
+        }
+        if system_text:
+            create_kwargs["system"] = system_text
+
+        # Set temperature only for models that accept sampling params
+        from agent.anthropic_adapter import _forbids_sampling_params
+        if not _forbids_sampling_params(model_normalized):
+            create_kwargs["temperature"] = config.get("temperature", 0.3)
+
+        sdk = client.beta if hasattr(client, "beta") else client
+        resp = sdk.messages.create(**create_kwargs)
+    except Exception as exc:
+        logger.warning("advisor Anthropic API call failed: %s", exc)
+        return json.dumps({"error": f"Advisor API call failed: {exc}"})
+
+    latency_ms = int((time.time() - start) * 1000)
+
+    # ---- Extract text content from response ----
+    advice_parts = []
+    for block in (resp.content or []):
+        if getattr(block, "type", None) == "text":
+            advice_parts.append(getattr(block, "text", ""))
+    advice = "".join(advice_parts) or "(advisor returned empty response)"
+
+    usage = resp.usage
+    return json.dumps({
+        "advice": advice,
+        "model": advisor_model,
+        "tokens_in": usage.input_tokens if usage else 0,
+        "tokens_out": usage.output_tokens if usage else 0,
+        "latency_ms": latency_ms,
+    }, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # Core advisor call
 # ---------------------------------------------------------------------------
 
@@ -199,8 +337,6 @@ def call_advisor(
     Returns a JSON string with ``advice``, ``model``, ``tokens_in``,
     ``tokens_out``, and ``latency_ms`` so the executor can see the cost.
     """
-    import openai
-
     # ---- Resolve model ----
     advisor_model = config.get("model")
     if not advisor_model and parent_agent:
@@ -274,7 +410,22 @@ def call_advisor(
         "content": f"Urgency: {urgency}\n\nMy question: {question}",
     })
 
-    # ---- API call ----
+    # ---- Route: Anthropic native vs OpenAI-compatible ----
+    provider = config.get("provider")
+    use_anthropic = _detect_anthropic_native(api_key, advisor_model, base_url, provider)
+
+    if use_anthropic:
+        return _call_advisor_anthropic(
+            advisor_messages=advisor_messages,
+            advisor_model=advisor_model,
+            api_key=api_key,
+            base_url=base_url,
+            config=config,
+        )
+
+    # ---- OpenAI-compatible API call ----
+    import openai
+
     client_kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         client_kwargs["base_url"] = base_url

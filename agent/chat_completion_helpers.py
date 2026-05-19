@@ -242,6 +242,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
         if ephemeral_out is not None:
             agent._ephemeral_max_output_tokens = None  # consume immediately
+        # Load advisor config for native Anthropic advisor tool injection
+        from agent.anthropic_adapter import _load_advisor_config
+        advisor_cfg = _load_advisor_config()
         return _transport.build_kwargs(
             model=agent.model,
             messages=anthropic_messages,
@@ -254,6 +257,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             base_url=getattr(agent, "_anthropic_base_url", None),
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+            advisor_config=advisor_cfg,
         )
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.

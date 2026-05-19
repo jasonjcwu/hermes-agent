@@ -1569,8 +1569,35 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         return agent._dispatch_delegate_task(function_args)
     elif function_name == "ask_advisor":
         from tools.advisor_tool import call_advisor, load_advisor_config, _make_use_counter
+
+        # ---- Native Anthropic advisor: already resolved by the API ----
+        # When the native ``advisor_20260301`` tool type is used, Anthropic
+        # internally routes the query and returns the advice directly in the
+        # tool_use block's input.  No separate API call needed.
+        if "advice" in function_args:
+            # Per-task invocation cap still applies
+            cfg = load_advisor_config()
+            if not hasattr(agent, "_advisor_counter"):
+                agent._advisor_counter = _make_use_counter()
+            max_uses = cfg.get("max_uses_per_task", 5)
+            if agent._advisor_counter["count"] >= max_uses:
+                return json.dumps({
+                    "error": f"Advisor invocation limit reached ({max_uses} per task). "
+                             f"Proceed with your best judgment.",
+                }, ensure_ascii=False)
+            agent._advisor_counter["count"] += 1
+            advice = function_args.get("advice", "")
+            advisor_model = function_args.get("model", "?")
+            stats = (
+                f"[🧠 advisor: {advisor_model}, "
+                f"{function_args.get('tokens_in', 0)}↓/"
+                f"{function_args.get('tokens_out', 0)}↑, "
+                f"call {agent._advisor_counter['count']}/{max_uses}]"
+            )
+            return f"{stats}\n\n{advice}"
+
+        # ---- Traditional tool-based advisor: make a separate API call ----
         cfg = load_advisor_config()
-        # Per-task invocation cap
         if not hasattr(agent, "_advisor_counter"):
             agent._advisor_counter = _make_use_counter()
         max_uses = cfg.get("max_uses_per_task", 5)
@@ -1591,7 +1618,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         parsed = json.loads(raw_result)
         if "error" in parsed:
             return json.dumps(parsed, ensure_ascii=False)
-        # Format for the executor: stats header + advice
         stats = (
             f"[🧠 advisor: {parsed.get('model', '?')}, "
             f"{parsed.get('tokens_in', 0)}↓/{parsed.get('tokens_out', 0)}↑, "
