@@ -2036,6 +2036,85 @@ def _build_advisor_tool(advisor_config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _strip_advisor_blocks(messages: List[Dict]) -> List[Dict]:
+    """Strip stale advisor tool blocks from Anthropic message history.
+
+    When the advisor tool is removed from the tools array (e.g. user disables
+    it for cost control), Anthropic rejects requests whose history contains
+    residual ``server_tool_use(name=advisor)`` or ``advisor_tool_result``
+    blocks.  This function replaces those blocks with ``<advisor_feedback>``
+    text blocks so the executor retains the semantic context of past advice.
+
+    Inspired by LiteLLM's ``strip_advisor_blocks_from_messages()``.
+    """
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        # Collect advisor server_tool_use IDs
+        advisor_ids: set = set()
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "server_tool_use"
+                and block.get("name") == "advisor"
+            ):
+                bid = block.get("id")
+                if bid:
+                    advisor_ids.add(bid)
+
+        if not advisor_ids:
+            continue
+
+        # Collect advice text from advisor_tool_result blocks
+        id_to_text: Dict[str, str] = {}
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "advisor_tool_result"
+                and block.get("tool_use_id") in advisor_ids
+            ):
+                raw = block.get("content") or ""
+                if isinstance(raw, str):
+                    id_to_text[block["tool_use_id"]] = raw
+                elif isinstance(raw, list):
+                    id_to_text[block["tool_use_id"]] = next(
+                        (b.get("text", "") for b in raw
+                         if isinstance(b, dict) and b.get("type") == "text"),
+                        "",
+                    )
+
+        # Replace: strip server_tool_use + advisor_tool_result,
+        # insert <advisor_feedback> text block for each exchange
+        new_content = []
+        for block in content:
+            if not isinstance(block, dict):
+                new_content.append(block)
+                continue
+            btype = block.get("type", "")
+            # Replace advisor server_tool_use with text
+            if btype == "server_tool_use" and block.get("name") == "advisor":
+                bid = block.get("id")
+                advice = id_to_text.get(bid, "")
+                if advice:
+                    new_content.append({
+                        "type": "text",
+                        "text": f"<advisor_feedback>\n{advice}\n</advisor_feedback>",
+                    })
+                # else: silently drop
+            # Always drop advisor_tool_result (text already captured above)
+            elif btype == "advisor_tool_result" and block.get("tool_use_id") in advisor_ids:
+                pass
+            else:
+                new_content.append(block)
+
+        message["content"] = new_content
+    return messages
+
+
 def build_anthropic_kwargs(
     model: str,
     messages: List[Dict],
@@ -2100,6 +2179,7 @@ def build_anthropic_kwargs(
     # ``advisor_20260301`` tool type.  The native tool tells Anthropic's API to
     # internally route advisor queries — no separate API call needed.
     # The advisor model is specified in the tool definition.
+    advisor_active = False
     if advisor_config and not _is_third_party_anthropic_endpoint(base_url):
         try:
             # Remove the OpenAI ask_advisor function tool (converted to Anthropic
@@ -2111,8 +2191,18 @@ def build_anthropic_kwargs(
             # Inject the native advisor tool
             advisor_tool = _build_advisor_tool(advisor_config)
             anthropic_tools.append(advisor_tool)
+            advisor_active = True
         except Exception:
             pass
+
+    # ---- Strip stale advisor blocks from message history ----
+    # When the advisor tool is *not* in the tools array (e.g. user disabled
+    # it for cost control on a follow-up turn), Anthropic rejects requests
+    # that contain residual server_tool_use(name=advisor) or
+    # advisor_tool_result blocks in the history.  Clean them out.
+    # Learned from LiteLLM's strip_advisor_blocks_from_messages().
+    if not advisor_active:
+        anthropic_messages = _strip_advisor_blocks(anthropic_messages)
 
     model = normalize_model_name(model, preserve_dots=preserve_dots)
     # effective_max_tokens = output cap for this call (≠ total context window)
